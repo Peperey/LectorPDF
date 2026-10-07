@@ -347,7 +347,7 @@ fun App(prefs: SharedPreferences, tick: Int) {
             title = { Text("Groq API key") },
             text = {
                 Column {
-                    Text("Groq: solo hace falta para leer PDFs escaneados (páginas que son imágenes). Los PDFs con texto se leen sin ella.", fontSize = 13.sp)
+                    Text("Groq: hace falta para traducir y para leer PDFs escaneados (páginas que son imágenes). Leer PDFs con texto, sin traducir, no la necesita.", fontSize = 13.sp)
                     Spacer(Modifier.height(8.dp))
                     OutlinedTextField(value = keyInput, onValueChange = { keyInput = it }, singleLine = true, placeholder = { Text("gsk_…") })
                     Spacer(Modifier.height(12.dp))
@@ -409,7 +409,24 @@ fun ReaderScreen(r: ReaderState) {
             Button(onClick = { if (r.speaking) r.pause() else r.play() }) { Text(if (r.speaking) "⏸ Pausa" else "▶ Leer") }
             Button(onClick = { r.goTo(r.page + 1) }) { Text("⏭") }
         }
-        Spacer(Modifier.height(8.dp))
+        Spacer(Modifier.height(4.dp))
+        TextButton(onClick = {
+            r.setTarget(
+                when (r.target) {
+                    "" -> "es"
+                    "es" -> "en"
+                    else -> ""
+                }
+            )
+        }) {
+            Text(
+                "🌐 Traducir: " + when (r.target) {
+                    "es" -> "→ Español"
+                    "en" -> "→ English"
+                    else -> "No"
+                }
+            )
+        }
         Text("Velocidad " + String.format(Locale.US, "%.1f", r.speed) + "x", color = Muted, fontSize = 13.sp)
         Slider(
             value = r.speed,

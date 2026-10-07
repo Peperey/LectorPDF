@@ -44,11 +44,14 @@ class ReaderState(
     var pageText by mutableStateOf("")
     var speed by mutableFloatStateOf(1f)
     var needKey by mutableStateOf(false)
+    var target by mutableStateOf("")
 
     private var doc: PDDocument? = null
     private var file: File? = null
     private val mutex = Mutex()
     private val cache = HashMap<Int, String>()
+    private val tcache = HashMap<String, String>()
+    private val tmutex = Mutex()
     private var tts: TextToSpeech? = null
     private var ttsOk = false
     @Volatile private var gen = 0
@@ -86,17 +89,54 @@ class ReaderState(
             if (st == TextToSpeech.SUCCESS) {
                 val t = tts
                 if (t != null) {
-                    var r = t.setLanguage(Locale("es", "MX"))
-                    if (r == TextToSpeech.LANG_MISSING_DATA || r == TextToSpeech.LANG_NOT_SUPPORTED) {
-                        r = t.setLanguage(Locale("es"))
-                    }
-                    ttsOk = r != TextToSpeech.LANG_MISSING_DATA && r != TextToSpeech.LANG_NOT_SUPPORTED
+                    applyLang()
                     t.setOnUtteranceProgressListener(listener)
-                    if (!ttsOk) status = "Falta la voz en español. Instálala en Ajustes > Salida de texto a voz."
                 }
             } else {
                 status = "No se pudo iniciar la voz del celular"
             }
+        }
+    }
+
+    private fun applyLang() {
+        val t = tts ?: return
+        val en = target == "en"
+        var r = t.setLanguage(if (en) Locale.US else Locale("es", "MX"))
+        if (!en && (r == TextToSpeech.LANG_MISSING_DATA || r == TextToSpeech.LANG_NOT_SUPPORTED)) {
+            r = t.setLanguage(Locale("es"))
+        }
+        ttsOk = r != TextToSpeech.LANG_MISSING_DATA && r != TextToSpeech.LANG_NOT_SUPPORTED
+        if (!ttsOk) {
+            status = if (en) "Falta la voz en inglés. Instálala en Ajustes > Salida de texto a voz."
+            else "Falta la voz en español. Instálala en Ajustes > Salida de texto a voz."
+        }
+    }
+
+    fun setTarget(t: String) {
+        target = t
+        applyLang()
+        if (isOpen && pageCount > 0) goTo(page)
+    }
+
+    private suspend fun spokenText(p: Int, quiet: Boolean): String {
+        val t = textOf(p, quiet)
+        val tg = target
+        if (tg.isEmpty() || t.isBlank()) return t
+        val k = "$p:$tg"
+        val c = tcache[k]
+        if (c != null) return c
+        return tmutex.withLock {
+            val c2 = tcache[k]
+            if (c2 != null) return@withLock c2
+            val key = getKey()
+            if (key.isBlank()) {
+                if (!quiet) needKey = true
+                throw Exception("Para traducir necesito la API key de Groq.")
+            }
+            if (!quiet) status = "Traduciendo página ${p + 1}…"
+            val tr = translateText(key, t, langName(tg)) { if (!quiet) status = it }
+            tcache[k] = tr
+            tr
         }
     }
 
@@ -144,6 +184,7 @@ class ReaderState(
         page = 0
         pageCount = 0
         cache.clear()
+        tcache.clear()
         chunks = emptyList()
         chunksPage = -1
         curChunk = 0
@@ -225,7 +266,7 @@ class ReaderState(
     }
 
     private suspend fun loadChunks() {
-        val t = textOf(page, false)
+        val t = spokenText(page, false)
         pageText = t.trim()
         chunks = speechChunks(t)
         chunksPage = page
@@ -289,7 +330,7 @@ class ReaderState(
         prefetchJob?.cancel()
         prefetchJob = scope.launch {
             try {
-                textOf(p, true)
+                spokenText(p, true)
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
             }

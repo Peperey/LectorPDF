@@ -187,3 +187,56 @@ fun youtubeFirstVideo(apiKey: String, q: String): String? {
         c.disconnect()
     }
 }
+
+val TEXT_MODELS = listOf("openai/gpt-oss-20b", "openai/gpt-oss-120b")
+
+fun langName(code: String): String = when (code) {
+    "en" -> "inglés"
+    else -> "español"
+}
+
+// Traduce el texto de una página con un modelo de texto de Groq.
+suspend fun translateText(key: String, text: String, lang: String, onWait: (String) -> Unit): String {
+    val parts = speechChunks(text, 3000)
+    val sb = StringBuilder()
+    for (part in parts) {
+        if (sb.isNotEmpty()) sb.append("\n\n")
+        sb.append(translatePart(key, part, lang, onWait))
+    }
+    return sb.toString()
+}
+
+private suspend fun translatePart(key: String, text: String, lang: String, onWait: (String) -> Unit): String {
+    val sys = "Eres un traductor. Traduce al $lang el texto que te envíe el usuario (viene de un PDF). " +
+        "Responde solo con la traducción, sin comentarios ni explicaciones. Conserva los párrafos. " +
+        "Si el texto ya está en $lang, devuélvelo igual."
+    val msgs = JSONArray()
+        .put(JSONObject().put("role", "system").put("content", sys))
+        .put(JSONObject().put("role", "user").put("content", text))
+    var reasoning = true
+    var last: Exception? = null
+    for (attempt in 0 until 3) {
+        for (m in TEXT_MODELS) {
+            try {
+                val body = JSONObject().put("model", m).put("temperature", 0.2).put("max_tokens", 1800)
+                    .put("messages", msgs)
+                if (reasoning) body.put("reasoning_effort", "low")
+                val raw = withContext(Dispatchers.IO) { post(key, body) }
+                return Regex("(?s)<think>.*?</think>").replace(raw, "").trim()
+            } catch (e: Exception) {
+                last = e
+                val msg = e.message ?: ""
+                if (msg.startsWith("Error 400") && reasoning) {
+                    reasoning = false
+                } else if (!msg.startsWith("Error 404") && !msg.startsWith("Error 429") && !msg.startsWith("Error 400")) {
+                    throw e
+                }
+            }
+        }
+        if (attempt < 2) {
+            onWait("Esperando el límite de la API (intento ${attempt + 2} de 3)…")
+            delay(20000)
+        }
+    }
+    throw last ?: Exception("No hay modelo de traducción disponible")
+}
