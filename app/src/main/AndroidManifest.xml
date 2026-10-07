@@ -5,6 +5,10 @@
     <queries>
         <intent><action android:name="android.intent.action.TTS_SERVICE"/></intent>
         <intent><action android:name="android.speech.action.RECOGNIZE_SPEECH"/></intent>
+        <intent>
+            <action android:name="android.intent.action.MAIN"/>
+            <category android:name="android.intent.category.LAUNCHER"/>
+        </intent>
     </queries>
     <application android:label="Lector PDF"
         android:icon="@mipmap/ic_launcher"

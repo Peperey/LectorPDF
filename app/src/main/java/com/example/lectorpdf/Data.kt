@@ -136,19 +136,54 @@ suspend fun ocrJpeg(key: String, jpeg: ByteArray, onWait: (String) -> Unit): Str
     throw last ?: Exception("No hay modelo de visión disponible")
 }
 
-private val MEDIA_TRIGGERS = setOf("pon", "ponme", "pone", "reproduce", "reproduceme", "toca", "ponla", "ponlo")
-private val MEDIA_WORDS = MEDIA_TRIGGERS + setOf(
-    "musica", "cancion", "canciones", "video", "videos", "youtube", "de", "la", "el", "los", "las", "en",
-    "un", "una", "me", "algo", "por", "favor", "del", "al", "unas", "unos", "quiero", "escuchar", "ver"
-)
+data class MediaCmd(val query: String, val full: String, val inApp: String?, val openOnly: Boolean)
 
-// Si la orden es de música/video devuelve qué buscar en YouTube; si no, null.
-fun mediaQuery(cmd: String): String? {
+private val MEDIA_TRIGGERS = setOf("pon", "ponme", "pone", "reproduce", "reproduceme", "toca", "ponla", "ponlo")
+private val MEDIA_KEYS = setOf("youtube", "musica", "cancion", "canciones", "video", "videos", "pelicula", "peliculas", "serie", "series")
+private val MEDIA_WORDS = MEDIA_TRIGGERS + MEDIA_KEYS + setOf(
+    "de", "la", "el", "los", "las", "en", "un", "una", "me", "algo", "por", "favor", "del", "al",
+    "unas", "unos", "quiero", "escuchar", "ver"
+)
+private val OPEN_TRIGGERS = setOf("abre", "abrir", "abreme", "inicia", "iniciar", "lanza", "ejecuta")
+private val APP_FILLER = setOf("la", "el", "app", "aplicacion", "de", "por", "favor", "mi", "en", "me")
+
+// Entiende órdenes de música/video/apps. Devuelve null si no es una de ellas.
+fun mediaCmd(cmd: String): MediaCmd? {
     val n = norm(cmd)
     if (n.isEmpty() || n.contains("pdf") || n.startsWith("lee")) return null
     val words = n.split(" ")
-    val isMedia = words[0] in MEDIA_TRIGGERS || words.any { it in setOf("youtube", "musica", "cancion", "canciones", "video", "videos") }
+    if (words[0] in OPEN_TRIGGERS) {
+        val app = words.drop(1).filter { it !in APP_FILLER }.joinToString(" ")
+        return if (app.isBlank()) null else MediaCmd("", "", app, true)
+    }
+    val isMedia = words[0] in MEDIA_TRIGGERS || words.any { it in MEDIA_KEYS }
     if (!isMedia) return null
-    val rest = words.filter { it !in MEDIA_WORDS }.joinToString(" ")
-    return if (rest.isBlank()) n else rest
+    val enIdx = words.lastIndexOf("en")
+    var inApp: String? = null
+    var qWords = words
+    if (enIdx > 0 && enIdx < words.size - 1) {
+        inApp = words.drop(enIdx + 1).filter { it !in APP_FILLER }.joinToString(" ").ifBlank { null }
+        qWords = words.take(enIdx)
+    }
+    if (inApp == "youtube") inApp = null
+    val q = qWords.filter { it !in MEDIA_WORDS }.joinToString(" ").ifBlank { qWords.joinToString(" ") }
+    val full = words.filter { it !in MEDIA_WORDS }.joinToString(" ").ifBlank { n }
+    return MediaCmd(q, full, inApp, false)
+}
+
+// Primer video que devuelve la búsqueda de YouTube (necesita API key de YouTube Data API v3).
+fun youtubeFirstVideo(apiKey: String, q: String): String? {
+    val url = "https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=1&q=" +
+        java.net.URLEncoder.encode(q, "UTF-8") + "&key=" + apiKey
+    val c = URL(url).openConnection() as HttpURLConnection
+    try {
+        c.connectTimeout = 20000
+        c.readTimeout = 20000
+        val items = JSONObject(readResponse(c)).optJSONArray("items") ?: return null
+        if (items.length() == 0) return null
+        val id = items.getJSONObject(0).getJSONObject("id").optString("videoId")
+        return if (id.isBlank()) null else id
+    } finally {
+        c.disconnect()
+    }
 }

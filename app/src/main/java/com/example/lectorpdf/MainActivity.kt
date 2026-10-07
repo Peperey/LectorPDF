@@ -2,6 +2,7 @@ package com.example.lectorpdf
 
 import android.Manifest
 import android.app.Activity
+import android.app.SearchManager
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
@@ -10,6 +11,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.provider.MediaStore
 import android.provider.Settings
 import android.speech.RecognizerIntent
 import androidx.activity.ComponentActivity
@@ -38,6 +40,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -73,6 +78,31 @@ fun hasFileAccess(ctx: Context): Boolean =
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) Environment.isExternalStorageManager()
     else ctx.checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
 
+fun findApp(ctx: Context, name: String): Pair<String, String>? {
+    val pm = ctx.packageManager
+    val list = pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
+    val target = norm(name)
+    var best: Pair<String, String>? = null
+    var bestScore = 0
+    for (ri in list) {
+        val label = ri.loadLabel(pm).toString()
+        val l = norm(label)
+        val sc = when {
+            l == target -> 4
+            l.startsWith(target) -> 3
+            l.contains(target) -> 2
+            l.length >= 3 && target.contains(l) -> 1
+            else -> 0
+        }
+        val cur = best
+        if (sc > bestScore || (sc > 0 && sc == bestScore && cur != null && label.length < cur.first.length)) {
+            best = Pair(label, ri.activityInfo.packageName)
+            bestScore = sc
+        }
+    }
+    return best
+}
+
 fun fmtDate(ms: Long): String = SimpleDateFormat("d MMM yyyy", Locale("es")).format(Date(ms))
 
 @Composable
@@ -80,8 +110,10 @@ fun App(prefs: SharedPreferences, tick: Int) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     var key by remember { mutableStateOf(prefs.getString("groq", "") ?: "") }
+    var ytKey by remember { mutableStateOf(prefs.getString("yt", "") ?: "") }
     var showKey by remember { mutableStateOf(false) }
     var keyInput by remember { mutableStateOf("") }
+    var ytInput by remember { mutableStateOf("") }
     var query by remember { mutableStateOf("") }
     var msg by remember { mutableStateOf("") }
     var permTick by remember { mutableIntStateOf(0) }
@@ -97,21 +129,94 @@ fun App(prefs: SharedPreferences, tick: Int) {
         .filter { score(it, tokens) > 0 }
         .sortedWith(compareByDescending<File> { score(it, tokens) }.thenByDescending { it.lastModified() })
 
+    fun openUrl(url: String, pkg: String? = null) {
+        val i = Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        if (pkg != null) i.setPackage(pkg)
+        ctx.startActivity(i)
+    }
+
+    fun runMedia(m: MediaCmd) {
+        val pm = ctx.packageManager
+        val target = if (m.inApp != null) findApp(ctx, m.inApp) else null
+        if (m.openOnly) {
+            if (target == null) {
+                msg = "No encontré la app «${m.inApp}» en tu celular."
+                return
+            }
+            val li = pm.getLaunchIntentForPackage(target.second)
+            if (li != null) {
+                li.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                ctx.startActivity(li)
+                msg = "Abriendo ${target.first}"
+            } else {
+                msg = "No pude abrir ${target.first}."
+            }
+            return
+        }
+        if (target != null) {
+            try {
+                val i = Intent(MediaStore.INTENT_ACTION_MEDIA_PLAY_FROM_SEARCH).setPackage(target.second)
+                    .putExtra(MediaStore.EXTRA_MEDIA_FOCUS, "vnd.android.cursor.item/*")
+                    .putExtra(SearchManager.QUERY, m.query)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                if (i.resolveActivity(pm) != null) {
+                    ctx.startActivity(i)
+                    msg = "Buscando «${m.query}» en ${target.first}"
+                    return
+                }
+                if (norm(target.first).contains("tubi")) {
+                    openUrl("https://tubitv.com/search/" + Uri.encode(m.query), target.second)
+                    msg = "Buscando «${m.query}» en ${target.first}"
+                    return
+                }
+                val li = pm.getLaunchIntentForPackage(target.second)
+                if (li != null) {
+                    li.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    ctx.startActivity(li)
+                    msg = "Abrí ${target.first}, pero no puedo buscar dentro de ella. Busca «${m.query}» tú."
+                    return
+                }
+            } catch (e: Exception) {
+                msg = "No pude abrir ${target.first}."
+                return
+            }
+        }
+        val q = m.full
+        val searchUrl = "https://www.youtube.com/results?search_query=" + Uri.encode(q)
+        if (ytKey.isBlank()) {
+            try {
+                openUrl(searchUrl)
+                msg = "Abrí la búsqueda en YouTube. Para que ponga el primer video solo, agrega tu API key de YouTube en 🔑."
+            } catch (e: Exception) {
+                msg = "No pude abrir YouTube."
+            }
+            return
+        }
+        msg = "Buscando en YouTube…"
+        scope.launch {
+            try {
+                val id = withContext(Dispatchers.IO) { youtubeFirstVideo(ytKey, q) }
+                if (id != null) {
+                    openUrl("https://www.youtube.com/watch?v=$id")
+                    msg = "Reproduciendo: $q"
+                } else {
+                    openUrl(searchUrl)
+                    msg = "No encontré resultados; abrí la búsqueda."
+                }
+            } catch (e: Exception) {
+                try { openUrl(searchUrl) } catch (e2: Exception) { }
+                msg = "Falló la API de YouTube (${(e.message ?: "").take(80)}). Abrí la búsqueda."
+            }
+        }
+    }
+
     val runCommand: (String) -> Unit = { text ->
         query = text
         msg = ""
         val toks = queryTokens(text)
-        val media = mediaQuery(text)
+        val media = mediaCmd(text)
         if (media != null) {
-            try {
-                ctx.startActivity(
-                    Intent(Intent.ACTION_VIEW, Uri.parse("https://www.youtube.com/results?search_query=" + Uri.encode(media)))
-                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                )
-                msg = "Abriendo YouTube: $media"
-            } catch (e: Exception) {
-                msg = "No pude abrir YouTube."
-            }
+            runMedia(media)
         } else if (all.isEmpty()) {
             msg = if (hasAccess) "No encontré PDFs en Descargas." else "Primero da el permiso para ver Descargas."
         } else if (toks.isEmpty()) {
@@ -174,7 +279,7 @@ fun App(prefs: SharedPreferences, tick: Int) {
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("📖 Lector PDF", fontSize = 26.sp, fontWeight = FontWeight.Bold, color = Ink, modifier = Modifier.weight(1f))
-                Text("🔑", fontSize = 22.sp, modifier = Modifier.clickable { keyInput = key; showKey = true }.padding(8.dp))
+                Text("🔑", fontSize = 22.sp, modifier = Modifier.clickable { keyInput = key; ytInput = ytKey; showKey = true }.padding(8.dp))
             }
             Spacer(Modifier.height(12.dp))
 
@@ -193,7 +298,7 @@ fun App(prefs: SharedPreferences, tick: Int) {
                 OutlinedTextField(
                     value = query,
                     onValueChange = { query = it; msg = "" },
-                    placeholder = { Text("léeme el PDF de… / pon música de…") },
+                    placeholder = { Text("léeme el PDF de… / pon música de… / abre Tubi") },
                     singleLine = true,
                     modifier = Modifier.weight(1f)
                 )
@@ -242,15 +347,20 @@ fun App(prefs: SharedPreferences, tick: Int) {
             title = { Text("Groq API key") },
             text = {
                 Column {
-                    Text("Solo hace falta para leer PDFs escaneados (páginas que son imágenes). Los PDFs con texto se leen sin ella.", fontSize = 13.sp)
+                    Text("Groq: solo hace falta para leer PDFs escaneados (páginas que son imágenes). Los PDFs con texto se leen sin ella.", fontSize = 13.sp)
                     Spacer(Modifier.height(8.dp))
                     OutlinedTextField(value = keyInput, onValueChange = { keyInput = it }, singleLine = true, placeholder = { Text("gsk_…") })
+                    Spacer(Modifier.height(12.dp))
+                    Text("YouTube (opcional): para que «pon música de…» reproduzca el primer video solo.", fontSize = 13.sp)
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(value = ytInput, onValueChange = { ytInput = it }, singleLine = true, placeholder = { Text("AIza…") })
                 }
             },
             confirmButton = {
                 TextButton(onClick = {
                     key = keyInput.trim()
-                    prefs.edit().putString("groq", key).apply()
+                    ytKey = ytInput.trim()
+                    prefs.edit().putString("groq", key).putString("yt", ytKey).apply()
                     reader.needKey = false
                     showKey = false
                 }) { Text("Guardar") }
