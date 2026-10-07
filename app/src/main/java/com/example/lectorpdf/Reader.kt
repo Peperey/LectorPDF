@@ -112,7 +112,7 @@ class ReaderState(
         }
     }
 
-    fun setTarget(t: String) {
+    fun chooseTarget(t: String) {
         target = t
         applyLang()
         if (isOpen && pageCount > 0) goTo(page)

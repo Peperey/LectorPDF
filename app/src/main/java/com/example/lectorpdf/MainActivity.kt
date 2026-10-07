@@ -411,7 +411,7 @@ fun ReaderScreen(r: ReaderState) {
         }
         Spacer(Modifier.height(4.dp))
         TextButton(onClick = {
-            r.setTarget(
+            r.chooseTarget(
                 when (r.target) {
                     "" -> "es"
                     "es" -> "en"
