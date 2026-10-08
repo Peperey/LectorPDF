@@ -1,5 +1,6 @@
 package com.example.lectorpdf
 
+import android.content.SharedPreferences
 import android.os.Environment
 import android.util.Base64
 import kotlinx.coroutines.Dispatchers
@@ -239,4 +240,112 @@ private suspend fun translatePart(key: String, text: String, lang: String, onWai
         }
     }
     throw last ?: Exception("No hay modelo de traducción disponible")
+}
+
+// ---------- Dónde me quedé ----------
+class Pos(val page: Int, val chunk: Int, val target: String, val total: Int)
+
+fun fileId(f: File): String = f.name + "_" + f.length()
+
+fun readPos(prefs: SharedPreferences, f: File): Pos? {
+    val s = prefs.getString("pos:" + fileId(f), null) ?: return null
+    val p = s.split("|")
+    if (p.size < 4) return null
+    val page = p[0].toIntOrNull() ?: return null
+    val chunk = p[1].toIntOrNull() ?: 0
+    val t = if (p[2] == "es" || p[2] == "en") p[2] else ""
+    val total = p[3].toIntOrNull() ?: 0
+    return Pos(page, chunk, t, total)
+}
+
+// ---------- Preguntas sobre el PDF ----------
+class Passage(val page: Int, val idx: Int, val text: String)
+
+private val QSTOP = setOf(
+    "que", "cual", "cuales", "cuanto", "cuanta", "cuantos", "cuantas", "quien", "quienes", "cuando", "donde",
+    "como", "por", "porque", "es", "son", "hay", "dice", "dicen", "segun", "sobre", "documento", "pdf",
+    "pagina", "paginas", "resume", "resumen", "explica", "dime", "si", "no", "ha", "han", "fue", "era",
+    "tiene", "tienen", "se", "su", "sus", "le", "les", "ese", "esa", "eso", "esto", "esta", "este", "un",
+    "una", "unos", "unas", "mas", "muy", "ya", "o", "u", "e", "a", "y", "el", "la", "los", "las", "de", "del",
+    "en", "con", "para", "al", "lo", "me", "mi", "mis", "menciona", "habla"
+)
+
+private fun renderPassages(list: Collection<Passage>): String =
+    list.joinToString("\n\n") { "[Página ${it.page + 1}] " + it.text }
+
+// Elige los fragmentos del PDF más relacionados con la pregunta (cabe en el límite de la API).
+fun pickContext(pages: List<String>, question: String, maxChars: Int = 9000): String {
+    val all = ArrayList<Passage>()
+    for ((pi, t) in pages.withIndex()) {
+        if (t.isBlank()) continue
+        speechChunks(t, 1200).forEachIndexed { ci, c -> all.add(Passage(pi, ci, c)) }
+    }
+    if (all.isEmpty()) return ""
+    if (all.sumOf { it.text.length } <= maxChars) return renderPassages(all)
+    val n = norm(question)
+    val forced = Regex("pagina[s]? (\\d+)").findAll(n).mapNotNull { it.groupValues[1].toIntOrNull()?.minus(1) }.toList()
+    val summary = Regex("(resume|resumen|resumir|de que trata|idea principal|trata de|tema)").containsMatchIn(n)
+    val toks = queryTokens(question).filter { it !in QSTOP }
+    val chosen = LinkedHashSet<Passage>()
+    var used = 0
+    fun addP(p: Passage) {
+        if (p in chosen || used + p.text.length > maxChars) return
+        chosen.add(p)
+        used += p.text.length + 20
+    }
+    all.filter { it.page in forced }.forEach { addP(it) }
+    if (!summary && toks.isNotEmpty()) {
+        val scored = all.map { p ->
+            val t = norm(p.text)
+            val sc = toks.count { t.contains(it) } * 10 + toks.sumOf { k -> minOf(5, t.split(k).size - 1) }
+            Pair(p, sc)
+        }.filter { it.second > 0 }.sortedByDescending { it.second }
+        scored.forEach { addP(it.first) }
+    }
+    if (chosen.isEmpty() || summary) {
+        addP(all.first())
+        val step = maxOf(1, all.size / 10)
+        var i = step
+        while (i < all.size && used < maxChars) {
+            addP(all[i])
+            i += step
+        }
+    }
+    return renderPassages(chosen.sortedWith(compareBy<Passage>({ it.page }, { it.idx })))
+}
+
+suspend fun askPdf(key: String, title: String, context: String, question: String, lang: String, onWait: (String) -> Unit): String {
+    val sys = "Eres un asistente que responde preguntas sobre un PDF titulado «$title». " +
+        "Usa SOLO los fragmentos del PDF que te doy (cada uno empieza con su número de página). " +
+        "Responde en $lang, de forma clara y breve (máximo 120 palabras), y menciona la página cuando ayude. " +
+        "Si la respuesta no está en los fragmentos, dilo con honestidad y no inventes."
+    val msgs = JSONArray()
+        .put(JSONObject().put("role", "system").put("content", sys))
+        .put(JSONObject().put("role", "user").put("content", "Fragmentos:\n$context\n\nPregunta: $question"))
+    var reasoning = true
+    var last: Exception? = null
+    for (attempt in 0 until 3) {
+        for (m in TEXT_MODELS) {
+            try {
+                val body = JSONObject().put("model", m).put("temperature", 0.2).put("max_tokens", 1000)
+                    .put("messages", msgs)
+                if (reasoning) body.put("reasoning_effort", "low")
+                val raw = withContext(Dispatchers.IO) { post(key, body) }
+                return Regex("(?s)<think>.*?</think>").replace(raw, "").trim()
+            } catch (e: Exception) {
+                last = e
+                val msg = e.message ?: ""
+                if (msg.startsWith("Error 400") && reasoning) {
+                    reasoning = false
+                } else if (!msg.startsWith("Error 404") && !msg.startsWith("Error 429") && !msg.startsWith("Error 400")) {
+                    throw e
+                }
+            }
+        }
+        if (attempt < 2) {
+            onWait("Esperando el límite de la API (intento ${attempt + 2} de 3)…")
+            delay(20000)
+        }
+    }
+    throw last ?: Exception("No hay modelo disponible")
 }

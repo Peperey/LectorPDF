@@ -335,6 +335,10 @@ fun App(prefs: SharedPreferences, tick: Int) {
                     ) {
                         Text(f.nameWithoutExtension, color = Ink, fontWeight = FontWeight.Medium, maxLines = 2, overflow = TextOverflow.Ellipsis)
                         Text(fmtDate(f.lastModified()) + " · " + (f.length() / 1024) + " KB", color = Muted, fontSize = 12.sp)
+                        val pos = readPos(prefs, f)
+                        if (pos != null) {
+                            Text("Vas en la página ${pos.page + 1} de ${pos.total}", color = Teal, fontSize = 12.sp)
+                        }
                     }
                 }
             }
@@ -347,7 +351,7 @@ fun App(prefs: SharedPreferences, tick: Int) {
             title = { Text("Groq API key") },
             text = {
                 Column {
-                    Text("Groq: hace falta para traducir y para leer PDFs escaneados (páginas que son imágenes). Leer PDFs con texto, sin traducir, no la necesita.", fontSize = 13.sp)
+                    Text("Groq: hace falta para traducir, hacer preguntas sobre el PDF y leer PDFs escaneados. Leer PDFs con texto, sin traducir, no la necesita.", fontSize = 13.sp)
                     Spacer(Modifier.height(8.dp))
                     OutlinedTextField(value = keyInput, onValueChange = { keyInput = it }, singleLine = true, placeholder = { Text("gsk_…") })
                     Spacer(Modifier.height(12.dp))
@@ -372,6 +376,10 @@ fun App(prefs: SharedPreferences, tick: Int) {
     }
 }
 
+fun isInfoStatus(st: String): Boolean =
+    listOf("Preparando", "Leyendo", "Esperando", "Abriendo", "Terminé", "Buscando", "Pensando", "Continúo", "«", "Pausado", "Velocidad", "Traduciendo")
+        .any { st.startsWith(it) }
+
 @Composable
 fun ReaderScreen(r: ReaderState) {
     val view = LocalView.current
@@ -379,6 +387,31 @@ fun ReaderScreen(r: ReaderState) {
         view.keepScreenOn = r.speaking
         onDispose { view.keepScreenOn = false }
     }
+    var resumeAfter by remember { mutableStateOf(false) }
+    var showAsk by remember { mutableStateOf(false) }
+    var askText by remember { mutableStateOf("") }
+
+    val speech = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { res ->
+        val t = res.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull()
+        if (res.resultCode == Activity.RESULT_OK && !t.isNullOrBlank()) r.voice(t, resumeAfter)
+        else if (resumeAfter) r.play()
+    }
+
+    fun listen() {
+        resumeAfter = r.speaking
+        r.pause()
+        val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+            .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            .putExtra(RecognizerIntent.EXTRA_LANGUAGE, "es-MX")
+            .putExtra(RecognizerIntent.EXTRA_PROMPT, "Di: pausa, siguiente, página 5… o hazme una pregunta")
+        try {
+            speech.launch(i)
+        } catch (e: Exception) {
+            r.status = "Este celular no tiene reconocimiento de voz."
+            if (resumeAfter) r.play()
+        }
+    }
+
     Column(
         Modifier.fillMaxSize().background(Bg).statusBarsPadding().navigationBarsPadding().padding(16.dp)
     ) {
@@ -392,6 +425,28 @@ fun ReaderScreen(r: ReaderState) {
             color = Muted, fontSize = 13.sp
         )
         Spacer(Modifier.height(8.dp))
+
+        if (r.question.isNotEmpty()) {
+            Column(
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(Color(0xFFE0F2F1)).padding(12.dp)
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "💬 " + r.question, fontWeight = FontWeight.Medium, color = Ink, fontSize = 14.sp,
+                        maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f)
+                    )
+                    Text("✕", fontSize = 18.sp, color = Muted, modifier = Modifier.clickable { r.clearAnswer() }.padding(start = 8.dp))
+                }
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    if (r.answer.isEmpty()) "Pensando…" else r.answer,
+                    color = Ink, fontSize = 15.sp,
+                    modifier = Modifier.heightIn(max = 170.dp).verticalScroll(rememberScrollState())
+                )
+            }
+            Spacer(Modifier.height(8.dp))
+        }
+
         Box(
             Modifier.weight(1f).fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(Color.White).padding(14.dp)
         ) {
@@ -401,31 +456,34 @@ fun ReaderScreen(r: ReaderState) {
         }
         if (r.status.isNotEmpty()) {
             Spacer(Modifier.height(8.dp))
-            Text(r.status, color = if (r.status.startsWith("Preparando") || r.status.startsWith("Leyendo") || r.status.startsWith("Esperando") || r.status.startsWith("Abriendo") || r.status.startsWith("Terminé")) Muted else RedErr, fontSize = 14.sp)
+            Text(r.status, color = if (isInfoStatus(r.status)) Muted else RedErr, fontSize = 14.sp)
         }
-        Spacer(Modifier.height(12.dp))
+        Spacer(Modifier.height(8.dp))
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {
             Button(onClick = { r.goTo(r.page - 1) }) { Text("⏮") }
             Button(onClick = { if (r.speaking) r.pause() else r.play() }) { Text(if (r.speaking) "⏸ Pausa" else "▶ Leer") }
             Button(onClick = { r.goTo(r.page + 1) }) { Text("⏭") }
         }
-        Spacer(Modifier.height(4.dp))
-        TextButton(onClick = {
-            r.chooseTarget(
-                when (r.target) {
-                    "" -> "es"
-                    "es" -> "en"
-                    else -> ""
-                }
-            )
-        }) {
-            Text(
-                "🌐 Traducir: " + when (r.target) {
-                    "es" -> "→ Español"
-                    "en" -> "→ English"
-                    else -> "No"
-                }
-            )
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {
+            TextButton(onClick = { listen() }) { Text("🎤 Voz") }
+            TextButton(onClick = { askText = ""; showAsk = true }) { Text("💬 Preguntar") }
+            TextButton(onClick = {
+                r.chooseTarget(
+                    when (r.target) {
+                        "" -> "es"
+                        "es" -> "en"
+                        else -> ""
+                    }
+                )
+            }) {
+                Text(
+                    "🌐 " + when (r.target) {
+                        "es" -> "→ Español"
+                        "en" -> "→ English"
+                        else -> "No"
+                    }
+                )
+            }
         }
         Text("Velocidad " + String.format(Locale.US, "%.1f", r.speed) + "x", color = Muted, fontSize = 13.sp)
         Slider(
@@ -433,6 +491,27 @@ fun ReaderScreen(r: ReaderState) {
             onValueChange = { r.speed = it },
             onValueChangeFinished = { if (r.speaking) r.play() },
             valueRange = 0.6f..2f
+        )
+    }
+
+    if (showAsk) {
+        AlertDialog(
+            onDismissRequest = { showAsk = false },
+            title = { Text("Pregunta sobre el PDF") },
+            text = {
+                OutlinedTextField(
+                    value = askText,
+                    onValueChange = { askText = it },
+                    placeholder = { Text("¿Cuánto dice que debo?") }
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showAsk = false
+                    if (askText.isNotBlank()) r.ask(askText.trim())
+                }) { Text("Preguntar") }
+            },
+            dismissButton = { TextButton(onClick = { showAsk = false }) { Text("Cancelar") } }
         )
     }
 }

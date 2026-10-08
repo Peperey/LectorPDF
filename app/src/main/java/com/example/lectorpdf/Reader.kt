@@ -45,6 +45,9 @@ class ReaderState(
     var speed by mutableFloatStateOf(1f)
     var needKey by mutableStateOf(false)
     var target by mutableStateOf("")
+    var question by mutableStateOf("")
+    var answer by mutableStateOf("")
+    var asking by mutableStateOf(false)
 
     private var doc: PDDocument? = null
     private var file: File? = null
@@ -52,6 +55,9 @@ class ReaderState(
     private val cache = HashMap<Int, String>()
     private val tcache = HashMap<String, String>()
     private val tmutex = Mutex()
+    private val prefs = app.getSharedPreferences("p", Context.MODE_PRIVATE)
+    private var qaPages: List<String>? = null
+    @Volatile private var resumeChunk = -1
     private var tts: TextToSpeech? = null
     private var ttsOk = false
     @Volatile private var gen = 0
@@ -64,7 +70,10 @@ class ReaderState(
     private val listener = object : UtteranceProgressListener() {
         override fun onStart(utteranceId: String?) {
             val u = parse(utteranceId) ?: return
-            if (u.gen == gen) curChunk = u.chunk
+            if (u.gen == gen) {
+                curChunk = u.chunk
+                save()
+            }
         }
 
         override fun onDone(utteranceId: String?) {
@@ -185,6 +194,11 @@ class ReaderState(
         pageCount = 0
         cache.clear()
         tcache.clear()
+        target = ""
+        question = ""
+        answer = ""
+        qaPages = null
+        resumeChunk = -1
         chunks = emptyList()
         chunksPage = -1
         curChunk = 0
@@ -202,7 +216,16 @@ class ReaderState(
                     status = "El PDF no tiene páginas"
                     return@launch
                 }
-                status = ""
+                val pos = readPos(prefs, src)
+                if (pos != null && pos.page in 0 until pageCount) {
+                    page = pos.page
+                    target = pos.target
+                    resumeChunk = pos.chunk
+                    status = "Continúo en la página ${pos.page + 1}"
+                } else {
+                    status = ""
+                }
+                applyLang()
                 play()
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
@@ -265,6 +288,215 @@ class ReaderState(
         }
     }
 
+
+    // ---------- Dónde me quedé ----------
+    private fun save() {
+        val src = file ?: return
+        if (!isOpen || pageCount == 0) return
+        prefs.edit().putString("pos:" + fileId(src), "$page|$curChunk|$target|$pageCount").apply()
+    }
+
+    private fun clearPos() {
+        val src = file ?: return
+        prefs.edit().remove("pos:" + fileId(src)).apply()
+    }
+
+    // ---------- Preguntas sobre el PDF ----------
+    private fun stripPage(d: PDDocument, p: Int): String {
+        val s = PDFTextStripper()
+        s.setSortByPosition(true)
+        s.setStartPage(p + 1)
+        s.setEndPage(p + 1)
+        return s.getText(d)
+    }
+
+    private suspend fun plainText(p: Int): String = mutex.withLock {
+        val c = cache[p]
+        if (c != null) return@withLock c
+        val d = doc ?: throw Exception("No hay PDF abierto")
+        val t = withContext(Dispatchers.IO) { stripPage(d, p) }
+        if (t.trim().length >= 15) cache[p] = t
+        t
+    }
+
+    private suspend fun allPages(): List<String> {
+        val c = qaPages
+        if (c != null) return c
+        status = "Leyendo el PDF…"
+        val list = ArrayList<String>()
+        for (i in 0 until pageCount) list.add(plainText(i))
+        qaPages = list
+        return list
+    }
+
+    fun ask(q: String) {
+        if (!isOpen || pageCount == 0) return
+        val key = getKey()
+        if (key.isBlank()) {
+            needKey = true
+            status = "Para preguntar necesito la API key de Groq."
+            return
+        }
+        pause()
+        question = q
+        answer = ""
+        asking = true
+        status = "Buscando en el PDF…"
+        scope.launch {
+            try {
+                val pages = allPages()
+                val ctxText = withContext(Dispatchers.Default) { pickContext(pages, q) }
+                if (ctxText.isBlank()) {
+                    answer = "No pude sacar texto de este PDF (parece escaneado). Léelo primero con ▶ para que la IA transcriba las páginas y vuelve a preguntar."
+                    status = ""
+                    return@launch
+                }
+                status = "Pensando…"
+                val lang = if (target == "en") "inglés" else "español"
+                val a = askPdf(key, title, ctxText, q, lang) { status = it }
+                answer = a
+                status = ""
+                speakAnswer(a)
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                status = e.message ?: "Error al preguntar"
+            } finally {
+                asking = false
+            }
+        }
+    }
+
+    private fun speakAnswer(a: String) {
+        val t = tts ?: return
+        if (!ttsOk) return
+        t.setSpeechRate(speed)
+        speechChunks(a, 700).forEachIndexed { i, c ->
+            t.speak(c, if (i == 0) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD, null, "ans:$i")
+        }
+    }
+
+    fun clearAnswer() {
+        question = ""
+        answer = ""
+        if (!speaking) tts?.stop()
+    }
+
+    // ---------- Órdenes por voz ----------
+    private fun has(n: String, vararg ws: String): Boolean {
+        val p = " $n "
+        return ws.any { p.contains(" $it ") }
+    }
+
+    private fun jumpAndPlay(p: Int): Boolean {
+        if (!isOpen || pageCount == 0) return false
+        if (p < 0) {
+            status = "Ya estás en la primera página."
+            return false
+        }
+        if (p >= pageCount) {
+            status = "Es la última página."
+            return false
+        }
+        pause()
+        page = p
+        curChunk = 0
+        chunksPage = -1
+        resumeChunk = -1
+        play()
+        return true
+    }
+
+    fun voice(text: String, wasSpeaking: Boolean) {
+        val n = norm(text)
+        val w = n.split(" ").filter { it.isNotEmpty() }
+        if (w.isEmpty()) {
+            if (wasSpeaking) play()
+            return
+        }
+        status = "«$text»"
+        val isQ = has(
+            n, "resume", "resumen", "resumeme", "explica", "explicame", "cuanto", "cuanta", "cuantos", "cuantas",
+            "quien", "quienes", "cuando", "donde", "como", "cual", "cuales", "dime", "menciona", "habla"
+        ) || n.contains("que dice") || n.contains("de que trata") || n.contains("por que") ||
+            n.contains("que significa") || n.startsWith("que es ") || n.startsWith("que son ")
+        if (!isQ && w.size <= 7) {
+            val m = Regex("pagina (\\d+)").find(n)
+            if (m != null) {
+                val num = m.groupValues[1].toIntOrNull() ?: 0
+                if (num in 1..pageCount) {
+                    jumpAndPlay(num - 1)
+                } else {
+                    status = "Este PDF tiene $pageCount páginas."
+                    if (wasSpeaking) play()
+                }
+                return
+            }
+        }
+        if (!isQ && w.size <= 5) {
+            when {
+                n.contains("traduc") -> {
+                    val t = when {
+                        has(n, "sin", "no", "quita", "quitar") -> ""
+                        n.contains("ingles") -> "en"
+                        else -> "es"
+                    }
+                    chooseTarget(t)
+                    if (wasSpeaking) play()
+                    return
+                }
+                n.contains("principio") || n.contains("inicio") || n.contains("empezar de nuevo") || n.contains("comienzo") -> {
+                    if (!jumpAndPlay(0) && wasSpeaking) play()
+                    return
+                }
+                has(n, "repite", "repetir", "repitela") || n.contains("otra vez") || n.contains("de nuevo") -> {
+                    if (!jumpAndPlay(page) && wasSpeaking) play()
+                    return
+                }
+                has(n, "siguiente", "adelante", "avanza", "adelanta") -> {
+                    if (!jumpAndPlay(page + 1) && wasSpeaking) play()
+                    return
+                }
+                has(n, "anterior", "atras", "regresa", "regresar", "retrocede") -> {
+                    if (!jumpAndPlay(page - 1) && wasSpeaking) play()
+                    return
+                }
+                has(n, "acelera", "rapido", "rapida", "deprisa") -> {
+                    speed = minOf(2f, Math.round((speed + 0.2f) * 10) / 10f)
+                    status = "Velocidad ${speed}x"
+                    if (wasSpeaking) play()
+                    return
+                }
+                has(n, "lento", "lenta", "despacio", "desacelera") -> {
+                    speed = maxOf(0.6f, Math.round((speed - 0.2f) * 10) / 10f)
+                    status = "Velocidad ${speed}x"
+                    if (wasSpeaking) play()
+                    return
+                }
+                has(n, "normal") -> {
+                    speed = 1f
+                    status = "Velocidad normal"
+                    if (wasSpeaking) play()
+                    return
+                }
+                has(n, "sigue", "seguir", "continua", "continuar", "reanuda", "reanudar", "lee", "leer", "play", "dale") -> {
+                    play()
+                    return
+                }
+                has(n, "pausa", "pausar", "detente", "detener", "para", "alto", "silencio", "espera", "stop", "callate") -> {
+                    pause()
+                    status = "Pausado"
+                    return
+                }
+            }
+        }
+        if (!isQ && w.size <= 2) {
+            status = "No entendí: «$text»"
+            if (wasSpeaking) play()
+            return
+        }
+        ask(text)
+    }
+
     private suspend fun loadChunks() {
         val t = spokenText(page, false)
         pageText = t.trim()
@@ -293,9 +525,14 @@ class ReaderState(
                     curChunk = 0
                     status = "Preparando página ${page + 1}…"
                     loadChunks()
+                    if (resumeChunk >= 0) {
+                        curChunk = resumeChunk.coerceIn(0, maxOf(0, chunks.size - 1))
+                        resumeChunk = -1
+                    }
                 }
                 if (g != gen) return
                 status = ""
+                save()
                 if (chunks.isEmpty()) {
                     if (page + 1 < pageCount) {
                         page++
@@ -304,6 +541,7 @@ class ReaderState(
                     }
                     speaking = false
                     status = "Terminé el documento"
+            clearPos()
                     return
                 }
                 val t = tts ?: return
@@ -326,7 +564,12 @@ class ReaderState(
     }
 
     private fun prefetch(p: Int) {
-        if (p >= pageCount || cache.containsKey(p)) return
+        if (p >= pageCount) return
+        if (target.isEmpty()) {
+            if (cache.containsKey(p)) return
+        } else if (tcache.containsKey("$p:$target")) {
+            return
+        }
         prefetchJob?.cancel()
         prefetchJob = scope.launch {
             try {
@@ -341,10 +584,12 @@ class ReaderState(
         if (page + 1 < pageCount) {
             page++
             curChunk = 0
+            resumeChunk = -1
             play()
         } else {
             speaking = false
             status = "Terminé el documento"
+            clearPos()
         }
     }
 
@@ -353,6 +598,7 @@ class ReaderState(
         gen++
         job?.cancel()
         tts?.stop()
+        save()
     }
 
     fun goTo(p: Int) {
@@ -364,6 +610,7 @@ class ReaderState(
         page = p
         curChunk = 0
         chunksPage = -1
+        resumeChunk = -1
         if (was) {
             play()
         } else {
