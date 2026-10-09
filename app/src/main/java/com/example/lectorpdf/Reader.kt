@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.pdf.PdfRenderer
+import android.media.MediaPlayer
 import android.net.Uri
 import android.os.ParcelFileDescriptor
 import android.provider.OpenableColumns
@@ -19,7 +20,11 @@ import com.tom_roush.pdfbox.text.PDFTextStripper
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -27,6 +32,8 @@ import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.util.Locale
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
 internal class Utt(val gen: Int, val page: Int, val chunk: Int, val last: Boolean)
 
@@ -48,6 +55,7 @@ class ReaderState(
     var question by mutableStateOf("")
     var answer by mutableStateOf("")
     var asking by mutableStateOf(false)
+    var voiceMode by mutableStateOf(app.getSharedPreferences("p", Context.MODE_PRIVATE).getString("voice_mode", "phone") ?: "phone")
 
     private var doc: PDDocument? = null
     private var file: File? = null
@@ -289,6 +297,111 @@ class ReaderState(
     }
 
 
+    // ---------- Voz clonada (servidor) ----------
+    private fun remoteCfg(): Remote? {
+        val gk = (prefs.getString("gr_key", "") ?: "").trim()
+        if (gk.isNotEmpty()) {
+            // Si no pones el ID de tu voz, usa una voz de ejemplo en español (Valentina, México).
+            val gv = (prefs.getString("gr_voice", "") ?: "").trim().ifEmpty { "B36pbz5_UoWn4BDl" }
+            return Remote("https://api.gradium.ai/api", gv, gk, "gradium")
+        }
+        var u = (prefs.getString("srv_url", "") ?: "").trim().trimEnd('/').removeSuffix("/v1")
+        if (u.isEmpty()) return null
+        if (!u.startsWith("http")) u = "http://$u"
+        val v = (prefs.getString("srv_voice", "") ?: "").trim()
+        val k = (prefs.getString("srv_key", "") ?: "").trim()
+        return Remote(u, v, k)
+    }
+
+    private fun countUse(cfg: Remote, n: Int) {
+        if (cfg.kind == "gradium") addUsage(prefs, n)
+    }
+
+    fun chooseVoice(m: String) {
+        val was = speaking
+        pause()
+        voiceMode = m
+        prefs.edit().putString("voice_mode", m).apply()
+        if (m == "server" && remoteCfg() == null) {
+            status = "Falta configurar el servidor de voz. Toca 🔑 en la pantalla de inicio."
+            return
+        }
+        if (was) play()
+    }
+
+    fun testServer() {
+        scope.launch {
+            try {
+                val cfg = remoteCfg() ?: throw Exception("Escribe primero la dirección del servidor.")
+                status = "Probando la voz del servidor…"
+                val f = withContext(Dispatchers.IO) {
+                    val t = "Hola, esta es mi voz. Ya puedo leer tus documentos."
+                    fetchSpeech(cfg, t, app.cacheDir).also { countUse(cfg, t.length) }
+                }
+                status = "Prueba lista: escucha la voz."
+                playFile(f)
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                status = "No pude conectar con el servidor de voz: ${e.message}"
+            }
+        }
+    }
+
+    private suspend fun playFile(f: File) = suspendCancellableCoroutine<Unit> { cont ->
+        val mp = MediaPlayer()
+        cont.invokeOnCancellation {
+            try { mp.release() } catch (e: Exception) { }
+            f.delete()
+        }
+        try {
+            mp.setDataSource(f.absolutePath)
+            mp.setOnCompletionListener {
+                mp.release()
+                f.delete()
+                if (cont.isActive) cont.resume(Unit)
+            }
+            mp.setOnErrorListener { _, _, _ ->
+                mp.release()
+                f.delete()
+                if (cont.isActive) cont.resumeWithException(Exception("No pude reproducir el audio del servidor"))
+                true
+            }
+            mp.setOnPreparedListener { p ->
+                try {
+                    p.playbackParams = p.playbackParams.setSpeed(speed)
+                } catch (e: Exception) { }
+                p.start()
+            }
+            mp.prepareAsync()
+        } catch (e: Exception) {
+            try { mp.release() } catch (e2: Exception) { }
+            f.delete()
+            if (cont.isActive) cont.resumeWithException(e)
+        }
+    }
+
+    // Genera el audio de cada pedazo en el servidor (el siguiente se prepara mientras suena el actual).
+    private suspend fun playRemoteList(g: Int, list: List<String>, from: Int, onChunk: (Int) -> Unit) {
+        val cfg = remoteCfg() ?: throw Exception("Falta configurar el servidor de voz. Toca 🔑 en la pantalla de inicio.")
+        if (list.isEmpty() || from >= list.size) return
+        coroutineScope {
+            var next: Deferred<File> = async(Dispatchers.IO) { fetchSpeech(cfg, list[from], app.cacheDir).also { countUse(cfg, list[from].length) } }
+            var i = from
+            while (i < list.size && g == gen) {
+                status = "Generando voz…"
+                val file = next.await()
+                status = ""
+                if (i + 1 < list.size) {
+                    val j = i + 1
+                    next = async(Dispatchers.IO) { fetchSpeech(cfg, list[j], app.cacheDir).also { countUse(cfg, list[j].length) } }
+                }
+                onChunk(i)
+                playFile(file)
+                i++
+            }
+        }
+    }
+
     // ---------- Dónde me quedé ----------
     private fun save() {
         val src = file ?: return
@@ -367,6 +480,19 @@ class ReaderState(
     }
 
     private fun speakAnswer(a: String) {
+        if (voiceMode == "server") {
+            val g = gen
+            job?.cancel()
+            job = scope.launch {
+                try {
+                    playRemoteList(g, speechChunks(a, 700), 0) { }
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                    status = e.message ?: "Error de la voz del servidor"
+                }
+            }
+            return
+        }
         val t = tts ?: return
         if (!ttsOk) return
         t.setSpeechRate(speed)
@@ -506,7 +632,7 @@ class ReaderState(
 
     fun play() {
         if (!isOpen || pageCount == 0) return
-        if (!ttsOk) {
+        if (voiceMode != "server" && !ttsOk) {
             status = "La voz aún no está lista. Intenta de nuevo en un momento."
             return
         }
@@ -542,6 +668,14 @@ class ReaderState(
                     speaking = false
                     status = "Terminé el documento"
             clearPos()
+                    return
+                }
+                if (voiceMode == "server") {
+                    playRemoteList(g, chunks, curChunk.coerceIn(0, chunks.size - 1)) { i ->
+                        curChunk = i
+                        save()
+                    }
+                    if (g == gen && speaking) nextPageAuto()
                     return
                 }
                 val t = tts ?: return

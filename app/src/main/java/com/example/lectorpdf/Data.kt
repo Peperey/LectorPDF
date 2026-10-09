@@ -12,6 +12,9 @@ import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import java.text.Normalizer
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 // Si un modelo deja de funcionar, mira la lista actual en console.groq.com/docs/models
 const val BASE = "https://api.groq.com/openai/v1"
@@ -348,4 +351,55 @@ suspend fun askPdf(key: String, title: String, context: String, question: String
         }
     }
     throw last ?: Exception("No hay modelo disponible")
+}
+
+// ---------- Voz clonada en un servidor (formato compatible con OpenAI: /v1/audio/speech) ----------
+class Remote(val url: String, val voice: String, val key: String, val kind: String = "openai")
+
+// Genera el audio de un texto. kind = "gradium" usa la API de Gradium; "openai" un servidor propio compatible con OpenAI.
+fun fetchSpeech(cfg: Remote, text: String, dir: File): File {
+    val gr = cfg.kind == "gradium"
+    val endpoint = if (gr) cfg.url + "/post/speech/tts" else cfg.url + "/v1/audio/speech"
+    val c = URL(endpoint).openConnection() as HttpURLConnection
+    try {
+        c.requestMethod = "POST"
+        c.doOutput = true
+        c.connectTimeout = 15000
+        c.readTimeout = 180000
+        c.setRequestProperty("Content-Type", "application/json")
+        val body = JSONObject()
+        if (gr) {
+            c.setRequestProperty("x-api-key", cfg.key)
+            body.put("text", text)
+                .put("voice_id", cfg.voice)
+                .put("output_format", "wav")
+                .put("only_audio", true)
+        } else {
+            if (cfg.key.isNotBlank()) c.setRequestProperty("Authorization", "Bearer " + cfg.key)
+            body.put("model", "tts-1")
+                .put("input", text)
+                .put("voice", if (cfg.voice.isBlank()) "alloy" else cfg.voice)
+                .put("response_format", "wav")
+        }
+        c.outputStream.use { it.write(body.toString().toByteArray()) }
+        val code = c.responseCode
+        if (code !in 200..299) {
+            val err = (c.errorStream?.bufferedReader()?.readText() ?: "").take(200)
+            throw Exception("Servidor de voz: error $code $err")
+        }
+        val out = File(dir, "tts_" + System.nanoTime() + ".wav")
+        c.inputStream.use { inp -> out.outputStream().use { o -> inp.copyTo(o) } }
+        return out
+    } finally {
+        c.disconnect()
+    }
+}
+
+// Caracteres gastados este mes con Gradium (solo cuenta lo que se genera desde esta app).
+fun usageKey(): String = "gr_" + SimpleDateFormat("yyyyMM", Locale.US).format(Date())
+
+fun usageThisMonth(prefs: SharedPreferences): Int = prefs.getInt(usageKey(), 0)
+
+fun addUsage(prefs: SharedPreferences, n: Int) {
+    prefs.edit().putInt(usageKey(), usageThisMonth(prefs) + n).apply()
 }

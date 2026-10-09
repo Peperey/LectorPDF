@@ -114,6 +114,11 @@ fun App(prefs: SharedPreferences, tick: Int) {
     var showKey by remember { mutableStateOf(false) }
     var keyInput by remember { mutableStateOf("") }
     var ytInput by remember { mutableStateOf("") }
+    var srvUrl by remember { mutableStateOf(prefs.getString("srv_url", "") ?: "") }
+    var srvVoice by remember { mutableStateOf(prefs.getString("srv_voice", "") ?: "") }
+    var srvKey by remember { mutableStateOf(prefs.getString("srv_key", "") ?: "") }
+    var grKey by remember { mutableStateOf(prefs.getString("gr_key", "") ?: "") }
+    var grVoice by remember { mutableStateOf(prefs.getString("gr_voice", "") ?: "") }
     var query by remember { mutableStateOf("") }
     var msg by remember { mutableStateOf("") }
     var permTick by remember { mutableIntStateOf(0) }
@@ -346,11 +351,24 @@ fun App(prefs: SharedPreferences, tick: Int) {
     }
 
     if (reader.needKey || showKey) {
+        val saveAll = {
+            key = keyInput.trim()
+            ytKey = ytInput.trim()
+            prefs.edit()
+                .putString("groq", key)
+                .putString("yt", ytKey)
+                .putString("srv_url", srvUrl.trim())
+                .putString("srv_voice", srvVoice.trim())
+                .putString("srv_key", srvKey.trim())
+                .putString("gr_key", grKey.trim())
+                .putString("gr_voice", grVoice.trim())
+                .apply()
+        }
         AlertDialog(
             onDismissRequest = { reader.needKey = false; showKey = false },
-            title = { Text("Groq API key") },
+            title = { Text("Claves y voz") },
             text = {
-                Column {
+                Column(Modifier.verticalScroll(rememberScrollState())) {
                     Text("Groq: hace falta para traducir, hacer preguntas sobre el PDF y leer PDFs escaneados. Leer PDFs con texto, sin traducir, no la necesita.", fontSize = 13.sp)
                     Spacer(Modifier.height(8.dp))
                     OutlinedTextField(value = keyInput, onValueChange = { keyInput = it }, singleLine = true, placeholder = { Text("gsk_…") })
@@ -358,13 +376,34 @@ fun App(prefs: SharedPreferences, tick: Int) {
                     Text("YouTube (opcional): para que «pon música de…» reproduzca el primer video solo.", fontSize = 13.sp)
                     Spacer(Modifier.height(8.dp))
                     OutlinedTextField(value = ytInput, onValueChange = { ytInput = it }, singleLine = true, placeholder = { Text("AIza…") })
+                    Spacer(Modifier.height(12.dp))
+                    Text("Mi voz con Gradium (gratis, sin computadora): clave de gradium.ai. Si la pones, se usa Gradium.", fontSize = 13.sp)
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(value = grKey, onValueChange = { grKey = it }, singleLine = true, label = { Text("Clave de Gradium") })
+                    Spacer(Modifier.height(6.dp))
+                    OutlinedTextField(value = grVoice, onValueChange = { grVoice = it }, singleLine = true, label = { Text("ID de tu voz (vacío = voz de ejemplo)") })
+                    Spacer(Modifier.height(4.dp))
+                    Text("Usado este mes: " + usageThisMonth(prefs) + " de 45,000 caracteres (solo cuenta lo de esta app).", fontSize = 12.sp, color = Muted)
+                    Spacer(Modifier.height(12.dp))
+                    Text("O un servidor propio en tu computadora (opcional), con formato compatible con OpenAI.", fontSize = 13.sp)
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(value = srvUrl, onValueChange = { srvUrl = it }, singleLine = true, label = { Text("Dirección") }, placeholder = { Text("http://192.168.1.50:4123") })
+                    Spacer(Modifier.height(6.dp))
+                    OutlinedTextField(value = srvVoice, onValueChange = { srvVoice = it }, singleLine = true, label = { Text("Nombre de la voz") })
+                    Spacer(Modifier.height(6.dp))
+                    OutlinedTextField(value = srvKey, onValueChange = { srvKey = it }, singleLine = true, label = { Text("Clave del servidor (si tiene)") })
+                    Spacer(Modifier.height(6.dp))
+                    TextButton(onClick = {
+                        saveAll()
+                        reader.needKey = false
+                        showKey = false
+                        reader.testServer()
+                    }) { Text("🔊 Probar mi voz") }
                 }
             },
             confirmButton = {
                 TextButton(onClick = {
-                    key = keyInput.trim()
-                    ytKey = ytInput.trim()
-                    prefs.edit().putString("groq", key).putString("yt", ytKey).apply()
+                    saveAll()
                     reader.needKey = false
                     showKey = false
                 }) { Text("Guardar") }
@@ -377,7 +416,7 @@ fun App(prefs: SharedPreferences, tick: Int) {
 }
 
 fun isInfoStatus(st: String): Boolean =
-    listOf("Preparando", "Leyendo", "Esperando", "Abriendo", "Terminé", "Buscando", "Pensando", "Continúo", "«", "Pausado", "Velocidad", "Traduciendo")
+    listOf("Preparando", "Leyendo", "Esperando", "Abriendo", "Terminé", "Buscando", "Pensando", "Continúo", "«", "Pausado", "Velocidad", "Traduciendo", "Generando", "Probando", "Prueba")
         .any { st.startsWith(it) }
 
 @Composable
@@ -465,7 +504,7 @@ fun ReaderScreen(r: ReaderState) {
             Button(onClick = { r.goTo(r.page + 1) }) { Text("⏭") }
         }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {
-            TextButton(onClick = { listen() }) { Text("🎤 Voz") }
+            TextButton(onClick = { listen() }) { Text("🎤 Orden") }
             TextButton(onClick = { askText = ""; showAsk = true }) { Text("💬 Preguntar") }
             TextButton(onClick = {
                 r.chooseTarget(
@@ -485,7 +524,12 @@ fun ReaderScreen(r: ReaderState) {
                 )
             }
         }
-        Text("Velocidad " + String.format(Locale.US, "%.1f", r.speed) + "x", color = Muted, fontSize = 13.sp)
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text("Velocidad " + String.format(Locale.US, "%.1f", r.speed) + "x", color = Muted, fontSize = 13.sp, modifier = Modifier.weight(1f))
+            TextButton(onClick = { r.chooseVoice(if (r.voiceMode == "server") "phone" else "server") }) {
+                Text("🗣 Voz: " + if (r.voiceMode == "server") "Mi voz" else "Celular")
+            }
+        }
         Slider(
             value = r.speed,
             onValueChange = { r.speed = it },
