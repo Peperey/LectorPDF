@@ -23,6 +23,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.launch
@@ -63,6 +64,7 @@ class ReaderState(
     private val cache = HashMap<Int, String>()
     private val tcache = HashMap<String, String>()
     private val tmutex = Mutex()
+    private val ttsLock = Mutex()
     private val prefs = app.getSharedPreferences("p", Context.MODE_PRIVATE)
     private var qaPages: List<String>? = null
     @Volatile private var resumeChunk = -1
@@ -334,16 +336,38 @@ class ReaderState(
             try {
                 val cfg = remoteCfg() ?: throw Exception("Escribe primero la dirección del servidor.")
                 status = "Probando la voz del servidor…"
-                val f = withContext(Dispatchers.IO) {
-                    val t = "Hola, esta es mi voz. Ya puedo leer tus documentos."
-                    fetchSpeech(cfg, t, app.cacheDir).also { countUse(cfg, t.length) }
-                }
+                val f = fetchLimited(cfg, "Hola, esta es mi voz. Ya puedo leer tus documentos.")
                 status = "Prueba lista: escucha la voz."
                 playFile(f)
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
                 status = "No pude conectar con el servidor de voz: ${e.message}"
             }
+        }
+    }
+
+    // Una sola petición a la vez al servidor de voz (el plan gratis limita las sesiones simultáneas).
+    // Si aun así responde "Concurrency limit", espera un momento y reintenta.
+    private suspend fun fetchLimited(cfg: Remote, text: String): File {
+        ttsLock.lock()
+        try {
+            var last: Exception? = null
+            for (attempt in 0..5) {
+                try {
+                    val f = withContext(Dispatchers.IO) { fetchSpeech(cfg, text, app.cacheDir) }
+                    countUse(cfg, text.length)
+                    return f
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                    last = e
+                    val m = e.message ?: ""
+                    if (!m.contains("oncurrency")) throw e
+                    delay(1500L * (attempt + 1))
+                }
+            }
+            throw last ?: Exception("El servidor de voz tiene el límite de sesiones simultáneas. Espera unos segundos y toca Leer.")
+        } finally {
+            ttsLock.unlock()
         }
     }
 
@@ -385,7 +409,7 @@ class ReaderState(
         val cfg = remoteCfg() ?: throw Exception("Falta configurar el servidor de voz. Toca 🔑 en la pantalla de inicio.")
         if (list.isEmpty() || from >= list.size) return
         coroutineScope {
-            var next: Deferred<File> = async(Dispatchers.IO) { fetchSpeech(cfg, list[from], app.cacheDir).also { countUse(cfg, list[from].length) } }
+            var next: Deferred<File> = async { fetchLimited(cfg, list[from]) }
             var i = from
             while (i < list.size && g == gen) {
                 status = "Generando voz…"
@@ -393,7 +417,7 @@ class ReaderState(
                 status = ""
                 if (i + 1 < list.size) {
                     val j = i + 1
-                    next = async(Dispatchers.IO) { fetchSpeech(cfg, list[j], app.cacheDir).also { countUse(cfg, list[j].length) } }
+                    next = async { fetchLimited(cfg, list[j]) }
                 }
                 onChunk(i)
                 playFile(file)
