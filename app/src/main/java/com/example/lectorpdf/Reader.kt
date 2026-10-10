@@ -337,7 +337,11 @@ class ReaderState(
                 val cfg = remoteCfg() ?: throw Exception("Escribe primero la dirección del servidor.")
                 status = "Probando la voz del servidor…"
                 val f = fetchLimited(cfg, "Hola, esta es mi voz. Ya puedo leer tus documentos.")
-                status = "Prueba lista: escucha la voz."
+                if (f.length() < 2000) {
+                    f.delete()
+                    throw Exception("El servidor devolvió un audio vacío. Revisa tu clave, el ID de la voz y tus créditos.")
+                }
+                status = "Prueba lista (${f.length() / 1024} KB de audio). Si no oyes nada, sube el volumen multimedia."
                 playFile(f)
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
@@ -384,10 +388,10 @@ class ReaderState(
                 f.delete()
                 if (cont.isActive) cont.resume(Unit)
             }
-            mp.setOnErrorListener { _, _, _ ->
+            mp.setOnErrorListener { _, what, extra ->
                 mp.release()
                 f.delete()
-                if (cont.isActive) cont.resumeWithException(Exception("No pude reproducir el audio del servidor"))
+                if (cont.isActive) cont.resumeWithException(Exception("No pude reproducir el audio (código $what/$extra)"))
                 true
             }
             mp.setOnPreparedListener { p ->
@@ -414,6 +418,10 @@ class ReaderState(
             while (i < list.size && g == gen) {
                 status = "Generando voz…"
                 val file = next.await()
+                if (file.length() < 2000) {
+                    file.delete()
+                    throw Exception("El servidor devolvió un audio vacío. Revisa tu clave, el ID de la voz y tus créditos.")
+                }
                 status = ""
                 if (i + 1 < list.size) {
                     val j = i + 1

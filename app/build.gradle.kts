@@ -10,8 +10,8 @@ android {
         applicationId = "com.example.lectorpdf"
         minSdk = 26
         targetSdk = 35
-        versionCode = 8
-        versionName = "7.0"
+        versionCode = 9
+        versionName = "8.0"
     }
     signingConfigs {
         getByName("debug") {

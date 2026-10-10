@@ -9,6 +9,8 @@ import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.net.HttpURLConnection
 import java.net.URL
 import java.text.Normalizer
@@ -372,7 +374,7 @@ fun fetchSpeech(cfg: Remote, text: String, dir: File): File {
             c.setRequestProperty("x-api-key", cfg.key)
             body.put("text", text)
                 .put("voice_id", cfg.voice)
-                .put("output_format", "wav")
+                .put("output_format", "pcm")
                 .put("only_audio", true)
         } else {
             if (cfg.key.isNotBlank()) c.setRequestProperty("Authorization", "Bearer " + cfg.key)
@@ -388,7 +390,16 @@ fun fetchSpeech(cfg: Remote, text: String, dir: File): File {
             throw Exception("Servidor de voz: error $code $err")
         }
         val out = File(dir, "tts_" + System.nanoTime() + ".wav")
-        c.inputStream.use { inp -> out.outputStream().use { o -> inp.copyTo(o) } }
+        val bytes = c.inputStream.use { it.readBytes() }
+        if (bytes.isNotEmpty() && bytes[0] == '{'.code.toByte()) {
+            throw Exception("Servidor de voz: " + String(bytes, Charsets.UTF_8).take(200))
+        }
+        val isWav = bytes.size > 4 && bytes[0] == 'R'.code.toByte() && bytes[1] == 'I'.code.toByte()
+        if (gr && !isWav) {
+            writeWav(out, bytes, 48000)   // Gradium entrega PCM de 48 kHz, 16 bits, mono
+        } else {
+            out.writeBytes(bytes)
+        }
         return out
     } finally {
         c.disconnect()
@@ -402,4 +413,26 @@ fun usageThisMonth(prefs: SharedPreferences): Int = prefs.getInt(usageKey(), 0)
 
 fun addUsage(prefs: SharedPreferences, n: Int) {
     prefs.edit().putInt(usageKey(), usageThisMonth(prefs) + n).apply()
+}
+
+// Envuelve audio PCM (16 bits, mono) en un archivo WAV con encabezado correcto.
+fun writeWav(out: File, pcm: ByteArray, rate: Int) {
+    val h = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN)
+    h.put("RIFF".toByteArray())
+    h.putInt(36 + pcm.size)
+    h.put("WAVE".toByteArray())
+    h.put("fmt ".toByteArray())
+    h.putInt(16)
+    h.putShort(1)
+    h.putShort(1)
+    h.putInt(rate)
+    h.putInt(rate * 2)
+    h.putShort(2)
+    h.putShort(16)
+    h.put("data".toByteArray())
+    h.putInt(pcm.size)
+    out.outputStream().use {
+        it.write(h.array())
+        it.write(pcm)
+    }
 }
